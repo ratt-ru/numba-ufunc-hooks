@@ -54,7 +54,7 @@ jobs:
           source .venv/bin/activate
           pip install --group test .
 
-      - name: Test xarray-ms
+      - name: Test numba-ufunc-hooks
         run: |
           source .venv/bin/activate
           py.test -s -vvv tests/ -Werror
