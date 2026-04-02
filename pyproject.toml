@@ -1,0 +1,26 @@
+[project]
+name = "numba-ufunc-hooks"
+version = "0.0.0"
+description = "Numba hooks to NumPy ufuncs"
+readme = "README.rst"
+authors = [
+    { name = "Simon Perkins", email = "simon.perkins@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = ["numpy >= 2.0.0", "numba"]
+
+[project.entry-points.numba_extensions]
+init = 'numba_ufunc_hooks:_install_extension'
+
+[build-system]
+requires = ["uv_build>=0.10.8,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.1",
+    "tbump>=6.11.0",
+]
+test = [
+    "pytest>=9.0.2",
+]
