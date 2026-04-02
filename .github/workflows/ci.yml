@@ -59,6 +59,12 @@ jobs:
           source .venv/bin/activate
           py.test -s -vvv tests/ -Werror
 
+      # Retest to ensure caching works
+      - name: Test numba-ufunc-hooks
+        run: |
+          source .venv/bin/activate
+          py.test -s -vvv tests/ -Werror
+
       # - name: Debug with tmate on failure
       #   if: ${{ failure() }}
       #   uses: mxschmitt/action-tmate@v3
