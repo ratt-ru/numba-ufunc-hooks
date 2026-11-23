@@ -4,6 +4,7 @@ call the internal ufunc FFT function pointers.
 """
 
 import ctypes
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -18,6 +19,7 @@ from numba.cpython.unsafe.tuple import tuple_setitem
 from numba.extending import intrinsic, overload, register_jitable
 from numba.np.numpy_support import as_dtype, from_dtype
 
+from numba_ufunc_hooks import ufunc_minimal
 from numba_ufunc_hooks.ufunc_minimal import MinimalPyUFuncObject
 
 
@@ -42,19 +44,51 @@ FFT_UFUNC_TABLE = None
 """(ufunc, arg_types) -> (ufunc_id, type_variant_id)"""
 FFT_UFUNC_MAP: Dict[UFuncKey, Tuple[int, int]] = {}
 
+# The layout fingerprint, published as a second global symbol.
+# Compiled code embeds the value it was compiled with and checks it
+# against this live copy on every call, catching stale caches.
+LAYOUT_FINGERPRINT_SYMBOL = "_numba_ufunc_hooks_pocketfft_layout_fingerprint"
+LAYOUT_FINGERPRINT = ctypes.c_uint64(0)
+# The value this process compiles into new code. Always below 2**63.
+_COMPILED_FINGERPRINT = 0
+# Published when the hooks are disabled. It is 2**63, so no compiled
+# fingerprint can equal it
+_DISABLED_FINGERPRINT = 2**63
+STALE_CACHE_MESSAGE = (
+    "numba-ufunc-hooks: this function was compiled against a different "
+    "NumPy ufunc layout, probably before NumPy was upgraded. "
+    "Please clear the Numba cache (delete the __pycache__ directories "
+    "holding its .nbi/.nbc files) and run again."
+)
+
 
 def _install_ufunc_table(pfu):
     """Create the FFT ufunc table and make it visible as an LLVM symbol
-    accessible from the numba intrinsic"""
+    accessible from the numba intrinsic.
+
+    Raises:
+        UfuncLayoutError: if the struct mirror doesn't match any of the ufuncs.
+            Nothing is installed in that case.
+    """
     global FFT_UFUNC_TABLE
     global FFT_UFUNC_MAP
+    global _COMPILED_FINGERPRINT
+
+    fft_ufuncs = []
+
+    for ufunc_name in FFT_UFUNCS:
+        if (fft_ufunc := getattr(pfu, ufunc_name, False)) is False:
+            raise ufunc_minimal.UfuncLayoutError(
+                f"{ufunc_name} not found in NumPy's pocketfft module"
+            )
+
+        # Looked up on the module so the guard can be replaced in tests
+        ufunc_minimal.validate_mirror(fft_ufunc)
+        fft_ufuncs.append(fft_ufunc)
 
     ufuncs = []
 
-    for u, ufunc_name in enumerate(FFT_UFUNCS):
-        if (fft_ufunc := getattr(pfu, ufunc_name, False)) is False:
-            raise ValueError(f"{ufunc_name} not found in pocketfft module")
-
+    for u, (ufunc_name, fft_ufunc) in enumerate(zip(FFT_UFUNCS, fft_ufuncs)):
         ufunc = MinimalPyUFuncObject.from_address(id(fft_ufunc))
         ufuncs.append(ufunc)
 
@@ -67,13 +101,72 @@ def _install_ufunc_table(pfu):
     FFT_UFUNC_TABLE = FFTUfuncTableType(*ufuncs)
     llvm.add_symbol(FFT_UFUNC_TABLE_SYMBOL, ctypes.addressof(FFT_UFUNC_TABLE))
 
+    _COMPILED_FINGERPRINT = _layout_fingerprint(FFT_UFUNC_TABLE)
+    LAYOUT_FINGERPRINT.value = _COMPILED_FINGERPRINT
+    llvm.add_symbol(LAYOUT_FINGERPRINT_SYMBOL, ctypes.addressof(LAYOUT_FINGERPRINT))
+
+
+def _layout_fingerprint(table) -> int:
+    """Identify everything the intrinsics bake into compiled code:
+    the struct mirror's size and field offsets, the ufunc order in the
+    table, each ufunc's type-variant numbering, and which ufuncs have
+    a data array. Cached code compiled under a different value would
+    pick the wrong inner loop."""
+    layout = (
+        ctypes.sizeof(MinimalPyUFuncObject),
+        MinimalPyUFuncObject.functions.offset,
+        MinimalPyUFuncObject.data.offset,
+        [
+            (
+                name,
+                ufunc.nargs,
+                ufunc.types[: ufunc.ntypes * ufunc.nargs],
+                bool(ufunc.data),
+            )
+            for name, ufunc in zip(FFT_UFUNCS, table)
+        ],
+    )
+    digest = hashlib.blake2b(repr(layout).encode(), digest_size=8).digest()
+    # 63 bits, so the value is a valid signed LLVM i64 constant
+    return int.from_bytes(digest, "little") & (2**63 - 1)
+
+
+def _install_disabled_symbols():
+    """Publish both symbols even though the hooks are disabled.
+
+    Code cached under an earlier, working layout still refers to them.
+    In MCJIT an unresolved symbol can abort the process, so publish a
+    zeroed table and a fingerprint that can never match. Cached code then
+    links, and its fingerprint check raises before it touches the table.
+    """
+    global FFT_UFUNC_TABLE
+    FFT_UFUNC_TABLE = FFTUfuncTableType()
+    llvm.add_symbol(FFT_UFUNC_TABLE_SYMBOL, ctypes.addressof(FFT_UFUNC_TABLE))
+    LAYOUT_FINGERPRINT.value = _DISABLED_FINGERPRINT
+    llvm.add_symbol(LAYOUT_FINGERPRINT_SYMBOL, ctypes.addressof(LAYOUT_FINGERPRINT))
+
 
 try:
-    from numpy.fft._pocketfft import pfu
-except ImportError:
-    raise ImportError("numpy does not appear to bundle pocketfft ufuncs")
-else:
+    try:
+        from numpy.fft._pocketfft import pfu
+    except ImportError as e:
+        raise ufunc_minimal.UfuncLayoutError(
+            "NumPy does not appear to bundle pocketfft ufuncs"
+        ) from e
     _install_ufunc_table(pfu)
+except ufunc_minimal.UfuncLayoutError:
+    _install_disabled_symbols()
+    raise
+
+
+def _external_global(module, llvm_type, symbol):
+    """Declare ``symbol`` as an external global in ``module``, once"""
+    if symbol in module.globals:
+        return module.globals[symbol]
+
+    glob = ir.GlobalVariable(module, llvm_type, symbol)
+    glob.linkage = "external"
+    return glob
 
 
 def intrinsic_fft_factory(ufunc_name):
@@ -99,6 +192,22 @@ def intrinsic_fft_factory(ufunc_name):
             a, factor, out = args
             a_type, factor_type, out_type = signature.args
             out_type = signature.return_type
+
+            # Refuse to run if this code was compiled (and perhaps cached)
+            # under a different layout fingerprint: the table indices and
+            # offsets baked in below would no longer be valid
+            i64_t = ir.IntType(64)
+            fingerprint_glob = _external_global(
+                builder.module, i64_t, LAYOUT_FINGERPRINT_SYMBOL
+            )
+            live_fingerprint = builder.load(fingerprint_glob)
+            is_stale = builder.icmp_unsigned(
+                "!=", live_fingerprint, ir.Constant(i64_t, _COMPILED_FINGERPRINT)
+            )
+            with cgutils.if_unlikely(builder, is_stale):
+                context.call_conv.return_user_exc(
+                    builder, RuntimeError, (STALE_CACHE_MESSAGE,)
+                )
 
             # Establish structs over the inut and out arrays
             # so that we can access their internal data
@@ -173,7 +282,6 @@ def intrinsic_fft_factory(ufunc_name):
             # ufunc_id and type_variant_id are compile-time constants from typing;
             # byte offsets are stable across processes (ctypes struct layout).
             i8_t = ir.IntType(8)
-            i64_t = ir.IntType(64)
             ufunc_size = ctypes.sizeof(MinimalPyUFuncObject)
             FUNCTION_OFFSET = ir.Constant(
                 i64_t, ufunc_id * ufunc_size + MinimalPyUFuncObject.functions.offset
@@ -184,15 +292,11 @@ def intrinsic_fft_factory(ufunc_name):
             TYPE_VARIANT_OFFSET = ir.Constant(i64_t, type_variant_id)
 
             # Declare (or retrieve) the external table global
-            if FFT_UFUNC_TABLE_SYMBOL not in builder.module.globals:
-                table_glob = ir.GlobalVariable(
-                    builder.module,
-                    ir.ArrayType(i8_t, ctypes.sizeof(FFT_UFUNC_TABLE)),
-                    FFT_UFUNC_TABLE_SYMBOL,
-                )
-                table_glob.linkage = "external"
-            else:
-                table_glob = builder.module.globals[FFT_UFUNC_TABLE_SYMBOL]
+            table_glob = _external_global(
+                builder.module,
+                ir.ArrayType(i8_t, ctypes.sizeof(FFT_UFUNC_TABLE)),
+                FFT_UFUNC_TABLE_SYMBOL,
+            )
 
             # Load ufunc function pointer: ufunc.functions[type_variant_id]
             fns_field = builder.gep(table_glob, [ZERO, FUNCTION_OFFSET])

@@ -27,7 +27,14 @@ class NPY_CASTING(CTypesEnum):
 
 # Numpy types expressed as ctypes
 _CTYPES_NPY_INTP = np.ctypeslib.as_ctypes_type(np.intp)
-_CTYPES_NPY_UINT32 = np.ctypeslib.as_ctypes_type(np.int32)
+_CTYPES_NPY_UINT32 = np.ctypeslib.as_ctypes_type(np.uint32)
+
+# The PyObject header differs between builds: the default build has
+# (ob_refcnt, ob_type), while the free-threaded build has a larger header
+# (ob_tid, flags, mutex, gc bits, local and shared refcounts, ob_type).
+# Both end in ob_type, and sizeof(PyObject) is object.__basicsize__,
+# so everything before ob_type is mirrored as opaque bytes.
+_PYOBJECT_HEAD_SIZE = object.__basicsize__ - ctypes.sizeof(ctypes.c_void_p)
 
 # ctypes function signature for a UFunc
 PyUFuncGenericFunction = ctypes.CFUNCTYPE(
@@ -70,7 +77,7 @@ class MinimalPyUFuncObject(ctypes.Structure):
 
     _fields_ = [
         # PyObject members
-        ("ob_refcnt", ctypes.c_ssize_t),
+        ("ob_head", ctypes.c_char * _PYOBJECT_HEAD_SIZE),
         ("ob_type", ctypes.c_void_p),
         # PyUfuncObject members follow
         ("nin", ctypes.c_int),
@@ -82,7 +89,9 @@ class MinimalPyUFuncObject(ctypes.Structure):
         ("ntypes", ctypes.c_int),
         ("reserved1", ctypes.c_int),
         ("name", ctypes.c_char_p),
-        ("types", ctypes.c_char_p),
+        # Type numbers, ntypes * nargs of them. Not a C string:
+        # NPY_BOOL is 0, so a c_char_p would stop early
+        ("types", ctypes.POINTER(ctypes.c_ubyte)),
         ("doc", ctypes.c_char_p),
         ("ptr", ctypes.c_void_p),
         # PyObject
@@ -126,3 +135,82 @@ class MinimalPyUFuncObject(ctypes.Structure):
         # the above are sufficient for extracting ufunc
         # function pointers
     ]
+
+
+class UfuncLayoutError(RuntimeError):
+    """The struct mirror disagrees with the running NumPy's PyUFuncObject"""
+
+
+class UfuncLayoutWarning(RuntimeWarning):
+    """Issued when the hooks are skipped because of a UfuncLayoutError"""
+
+
+def validate_mirror(ufunc: np.ufunc, mirror=MinimalPyUFuncObject) -> None:
+    """Check that ``mirror`` reads ``ufunc`` the way Python itself reports it.
+
+    Every field Python exposes is compared with what the mirror reads at
+    that field's offset. The checks run from the start of the struct
+    outwards, and pointers are only followed once every plain integer
+    field has matched, so a badly misaligned mirror is rejected before
+    it dereferences garbage.
+
+    Raises:
+        UfuncLayoutError: listing each field that disagrees.
+    """
+    name = ufunc.__name__
+
+    def fail(problems):
+        raise UfuncLayoutError(
+            f"NumPy's PyUFuncObject layout for '{name}' does not match the "
+            f"struct mirror (NumPy {np.__version__}): {'; '.join(problems)}"
+        )
+
+    basicsize = type(ufunc).__basicsize__
+    if ctypes.sizeof(mirror) > basicsize:
+        fail([f"mirror is {ctypes.sizeof(mirror)} bytes, ufunc is {basicsize}"])
+
+    view = mirror.from_address(id(ufunc))
+    problems = []
+
+    if view.ob_type != id(type(ufunc)):
+        problems.append("ob_type is not type(ufunc)")
+
+    for field in ("nin", "nout", "nargs", "ntypes"):
+        if (got := getattr(view, field)) != (want := getattr(ufunc, field)):
+            problems.append(f"{field} is {got}, expected {want}")
+
+    want_core = ufunc.signature is not None
+    if view.core_enabled != want_core:
+        problems.append(f"core_enabled is {view.core_enabled}, expected {want_core}")
+
+    if problems:
+        fail(problems)
+
+    # The integer fields agree, so the pointers should be safe to follow
+    if (got_name := view.name) != name.encode():
+        problems.append(f"name is {got_name!r}")
+
+    if not view.functions:
+        problems.append("functions is NULL")
+
+    if not view.types:
+        problems.append("types is NULL")
+    else:
+        want_types = [
+            np.dtype(c).num for sig in ufunc.types for c in sig.replace("->", "")
+        ]
+        got_types = view.types[: len(want_types)]
+        if got_types != want_types:
+            problems.append(f"types are {got_types}, expected {want_types}")
+
+    want_sig = None if ufunc.signature is None else ufunc.signature.encode()
+    # NumPy stores the signature as given and Python reports it
+    # with whitespace removed
+    got_sig = view.core_signature
+    if got_sig is not None:
+        got_sig = got_sig.replace(b" ", b"")
+    if got_sig != want_sig:
+        problems.append(f"core_signature is {got_sig!r}, expected {want_sig!r}")
+
+    if problems:
+        fail(problems)
